@@ -52,9 +52,7 @@ jobs:
           key: pjsip-2.17-openssl-3.0.16-ndk-28.2.13676358-arm64-${{ hashFiles('scripts/build-pjsip-android.sh') }}
       - name: Build PJSIP 2.17 + OpenSSL 3.0.16 from source
         if: steps.cache-pjsip.outputs.cache-hit != 'true'
-        env:
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
-        run: ./scripts/build-pjsip-android.sh --abis arm64-v8a --sync-java
+        run: ANDROID_NDK_ROOT="${ANDROID_HOME}/ndk/28.2.13676358" ./scripts/build-pjsip-android.sh --abis arm64-v8a --sync-java
       - run: flutter pub get
       - name: Build Release APK (signed when keystore secrets are configured)
         shell: bash
