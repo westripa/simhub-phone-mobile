@@ -34,13 +34,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install NDK 28 & SWIG
+      - name: Install Android NDK 28 & SWIG
         run: |
           sudo apt-get update
           sudo apt-get install -y swig
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "ndk;28.2.13676358"
+          SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n 1)"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;28.2.13676358"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
