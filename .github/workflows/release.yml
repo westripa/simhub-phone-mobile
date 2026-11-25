@@ -1,0 +1,89 @@
+name: Release Android
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Flutter Analyze & Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+  release-android:
+    name: Build & Publish Android Release APK
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK 28 & SWIG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y swig
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;28.2.13676358"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Cache PJSIP native build
+        id: cache-pjsip
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/app/src/main/jniLibs/arm64-v8a/*.so
+            android/app/src/main/java/org/pjsip/pjsua2
+          key: pjsip-2.17-openssl-3.0.16-ndk-28.2.13676358-arm64-${{ hashFiles('scripts/build-pjsip-android.sh') }}
+      - name: Build PJSIP 2.17 + OpenSSL 3.0.16 from source
+        if: steps.cache-pjsip.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: ./scripts/build-pjsip-android.sh --abis arm64-v8a --sync-java
+      - run: flutter pub get
+      - name: Build Release APK (signed when keystore secrets are configured)
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          SIGNED_SUFFIX="debug-signed"
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+            SIGNED_SUFFIX="signed"
+          fi
+          flutter build apk --release --target-platform android-arm64 -PabiFilters=arm64-v8a
+          mkdir -p release-assets
+          cp build/app/outputs/flutter-apk/app-release.apk "release-assets/SimHub-Phone-${VERSION}-arm64-${SIGNED_SUFFIX}.apk"
+          cp LICENSE release-assets/LICENSE.txt
+          cp THIRD_PARTY_NOTICES.md release-assets/THIRD_PARTY_NOTICES.md
+          (cd release-assets && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-apk
+          path: release-assets/*
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: release-assets/*
+          generate_release_notes: true
