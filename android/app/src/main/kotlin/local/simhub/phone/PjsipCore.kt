@@ -191,6 +191,7 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
             }.onFailure { err ->
                 val msg = err.message.orEmpty()
                 if (msg.contains("PJSIP_EBUSY") || msg.contains("171001")) {
+                    Log.i("PjsipCore", "registration already in flight for account=${maskId(key)}")
                     regStates[key] = "registering"
                 } else {
                     managedAccounts.remove(key)
@@ -249,6 +250,7 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
                 }.onFailure { err ->
                     val msg = err.message.orEmpty()
                     if (msg.contains("PJSIP_EBUSY") || msg.contains("171001")) {
+                        Log.i("PjsipCore", "registration already in flight for account=${maskId(key)}")
                         regStates[key] = "registering"
                     } else {
                         managedAccounts.remove(key)
@@ -527,23 +529,26 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
     }
 
     internal fun onRegState(accountKey: String, prm: OnRegStateParam) {
-        val registered = prm.code == 200
+        val code = prm.code
+        val reason = prm.reason.trim()
+        val registered = code == 200
         Log.i(
             "PjsipCore",
-            "reg state account=${maskId(accountKey)} code=${prm.code}",
+            "reg state account=${maskId(accountKey)} code=$code",
         )
-        regStates[accountKey] = if (registered) "registered" else "failed"
-        regReasons[accountKey] = if (registered) {
-            null
-        } else {
-            listOfNotNull(
-                prm.code.takeIf { it > 0 }?.toString(),
-                prm.reason.trim().takeIf { it.isNotEmpty() },
-            ).joinToString(" ").ifBlank { "注册失败" }
-        }
-        emitAccountsSnapshot()
-        emitAggregateRegistration(code = prm.code, reason = prm.reason)
         main.post {
+            if (!managedAccounts.containsKey(accountKey)) return@post
+            regStates[accountKey] = if (registered) "registered" else "failed"
+            regReasons[accountKey] = if (registered) {
+                null
+            } else {
+                listOfNotNull(
+                    code.takeIf { it > 0 }?.toString(),
+                    reason.takeIf { it.isNotEmpty() },
+                ).joinToString(" ").ifBlank { "注册失败" }
+            }
+            emitAccountsSnapshot()
+            emitAggregateRegistration(code = code, reason = reason)
             val needsRetry = storedOrder.any {
                 it.enabled && it.hasCredential && regStates[it.accountKey] != "registered"
             }
@@ -874,8 +879,10 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         accountConfig.regConfig.registrarUri = registrar
         accountConfig.regConfig.registerOnAdd = registerNow
         accountConfig.regConfig.setTimeoutSec(acc.registrationExpiresSec.toLong())
-        accountConfig.regConfig.setRetryIntervalSec(30)
-        accountConfig.regConfig.setFirstRetryIntervalSec(10)
+        // Retries are owned solely by PjsipCore's backoff scheduler and network callbacks;
+        // disabling PJSIP's internal failure retry avoids overlapping REGISTER PJSIP_EBUSY errors.
+        accountConfig.regConfig.setRetryIntervalSec(0)
+        accountConfig.regConfig.setFirstRetryIntervalSec(0)
         accountConfig.sipConfig.proxies.add(proxyUri(registrar))
 
         val authUser = acc.authUsername.ifBlank { acc.username }

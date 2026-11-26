@@ -377,6 +377,26 @@ void main() {
       'TLS 证书校验或握手失败',
     );
     expect(
+      formatRegistrationError('503 End of file (PJ_EEOF)'),
+      '连接被网络或代理中断，若开启 Clash/VPN 请将本应用或网关域名设为直连',
+    );
+    expect(
+      formatRegistrationError('503 Connection reset by peer'),
+      '连接被网络或代理中断，若开启 Clash/VPN 请将本应用或网关域名设为直连',
+    );
+    expect(
+      formatRegistrationError('503 Connection refused'),
+      '无法连接 SIP 服务器，请检查网络或代理分流设置',
+    );
+    expect(
+      formatRegistrationError('503 Network is unreachable'),
+      '无法连接 SIP 服务器，请检查网络或代理分流设置',
+    );
+    expect(
+      formatRegistrationError('503 Unable to resolve host'),
+      '无法连接 SIP 服务器，请检查网络或代理分流设置',
+    );
+    expect(
       formatRegistrationError('503 Service Unavailable'),
       '网关暂不可用（503），正在重试',
     );

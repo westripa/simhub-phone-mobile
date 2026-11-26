@@ -118,7 +118,7 @@ String? formatRegistrationError(String? raw) {
   final code = codeMatch != null ? int.tryParse(codeMatch.group(1)!) : null;
   final lower = text.toLowerCase();
   if (code == 401 || code == 407 || lower.contains('unauthorized')) {
-    return '账号认证失败（$code），请重新扫码配网';
+    return '账号认证失败（${code ?? 401}），请重新扫码配网';
   }
   if (code == 403 || lower.contains('forbidden')) {
     return '账号权限被拒绝（403）';
@@ -135,11 +135,23 @@ String? formatRegistrationError(String? raw) {
       lower.contains('handshake')) {
     return 'TLS 证书校验或握手失败';
   }
+  if (lower.contains('end of file') ||
+      lower.contains('pj_eeof') ||
+      lower.contains('connection reset') ||
+      lower.contains('broken pipe') ||
+      RegExp(r'\beof\b').hasMatch(lower)) {
+    return '连接被网络或代理中断，若开启 Clash/VPN 请将本应用或网关域名设为直连';
+  }
+  if (lower.contains('resolve') ||
+      lower.contains('dns') ||
+      lower.contains('gethostbyname') ||
+      lower.contains('unreachable') ||
+      lower.contains('refused') ||
+      lower.contains('network is')) {
+    return '无法连接 SIP 服务器，请检查网络或代理分流设置';
+  }
   if (code == 502 || code == 503 || code == 504) {
     return '网关暂不可用（$code），正在重试';
-  }
-  if (lower.contains('resolve') || lower.contains('dns') || lower.contains('unreachable') || lower.contains('refused')) {
-    return '无法连接 SIP 服务器，请检查网络';
   }
   if (code != null) {
     return '注册异常（SIP $code）';
