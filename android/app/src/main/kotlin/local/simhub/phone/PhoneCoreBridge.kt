@@ -1,11 +1,18 @@
 package local.simhub.phone
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
+import androidx.core.content.FileProvider
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.security.MessageDigest
 
 /**
  * Bridge between Flutter's PhoneCore and the process-wide SIP core owned by
@@ -169,6 +176,72 @@ class PhoneCoreBridge(
                     val json = call.argument<String>("json").orEmpty()
                     historyPrefs().edit().putString("call_history", json).apply()
                     result.success(null)
+                }
+                "getAppVersion" -> {
+                    val ctx = requireContext()
+                    val pkg = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+                    val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        pkg.longVersionCode.toInt()
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pkg.versionCode
+                    }
+                    result.success(
+                        mapOf(
+                            "version_name" to (pkg.versionName ?: "0.2.0"),
+                            "version_code" to versionCode,
+                            "abis" to Build.SUPPORTED_ABIS.toList(),
+                        ),
+                    )
+                }
+                "getUpdateCacheDir" -> {
+                    val dir = File(requireContext().cacheDir, "updates")
+                    if (!dir.exists()) dir.mkdirs()
+                    result.success(dir.absolutePath)
+                }
+                "installApk" -> {
+                    val ctx = requireContext()
+                    val path = call.argument<String>("file_path").orEmpty().trim()
+                    val expectedSha256 = call.argument<String>("expected_sha256")?.trim()?.lowercase().orEmpty()
+                    val cacheRoot = File(ctx.cacheDir, "updates").canonicalFile
+                    if (!cacheRoot.exists()) cacheRoot.mkdirs()
+                    val file = File(path).canonicalFile
+                    val rootPrefix = cacheRoot.path + File.separator
+                    if (!file.path.startsWith(rootPrefix) || !file.isFile) {
+                        throw IllegalArgumentException("无效的安装包文件路径")
+                    }
+                    if (expectedSha256.isNotEmpty()) {
+                        val digest = MessageDigest.getInstance("SHA-256")
+                        file.inputStream().use { input ->
+                            val buf = ByteArray(16 * 1024)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n <= 0) break
+                                digest.update(buf, 0, n)
+                            }
+                        }
+                        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+                        if (actual != expectedSha256) {
+                            runCatching { file.delete() }
+                            throw IllegalStateException("安装包 SHA-256 校验失败，已删除损坏文件")
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.packageManager.canRequestPackageInstalls()) {
+                        val permIntent = Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${ctx.packageName}"),
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        ctx.startActivity(permIntent)
+                        result.success("permission_required")
+                        return
+                    }
+                    val contentUri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(contentUri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    ctx.startActivity(installIntent)
+                    result.success("launched")
                 }
                 else -> result.notImplemented()
             }

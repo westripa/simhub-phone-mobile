@@ -57,7 +57,8 @@ base64 -w 0 simhub-release.jks
 ## GitHub Actions CI/CD
 
 - **CI（`.github/workflows/ci.yml`）**：每次 push 到 `main` 或发起 PR 时自动运行 `flutter analyze`、`flutter test`，并缓存/源码编译 PJSIP 验证 `arm64-v8a` APK 可构建。
-- **发版（`.github/workflows/release.yml`）**：推送版本 tag（如 `git tag v0.1.0 && git push origin v0.1.0`）或在 Actions 页面手动触发，自动构建 Release APK、生成 `SHA256SUMS.txt` 并发布至 GitHub Releases。
+- **发版（`.github/workflows/release.yml`）**：推送版本 tag（如 `git tag v0.2.0 && git push origin v0.2.0`）或在 Actions 页面手动触发，自动构建签名 Release APK、`SHA256SUMS.txt` 与应用内升级清单 `latest.json`，并发布至 `westripa/simhub-phone-mobile` GitHub Releases。
+- **应用内自动更新**：支持在客户端启动后自动静默检查或由「号码管理 -> 右上角菜单 -> 检查更新」触发，从 GitHub Releases 拉取 `latest.json`、校验 SHA-256 摘要后调用系统 `FileProvider` 安装器一键升级。
 
 ## iOS 说明
 

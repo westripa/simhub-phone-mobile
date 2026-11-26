@@ -2,11 +2,13 @@ import 'dart:async';
 
 import 'package:material_ui/material_ui.dart';
 
+import '../core/app_updater.dart';
 import '../core/call_history_store.dart';
 import '../core/debug_sip_config.dart';
 import '../core/native_phone_core.dart';
 import '../core/phone_core.dart';
 import '../state/phone_controller.dart';
+import '../widgets/update_sheet.dart';
 import 'active_call_page.dart';
 import 'dialer_page.dart';
 import 'history_page.dart';
@@ -17,10 +19,12 @@ class HomeShell extends StatefulWidget {
     super.key,
     this.core,
     this.historyStore,
+    this.updater,
   });
 
   final PhoneCore? core;
   final CallHistoryStore? historyStore;
+  final AppUpdaterController? updater;
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -28,6 +32,9 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   late final PhoneController controller;
+  late final AppUpdaterController updater;
+  bool _ownsUpdater = false;
+  bool _updateBannerDismissed = false;
   int tab = 0;
 
   @override
@@ -41,10 +48,29 @@ class _HomeShellState extends State<HomeShell> {
           widget.historyStore ?? (useNative ? NativeCallHistoryStore() : null),
     )..addListener(_refresh);
     unawaited(controller.start());
+
+    if (widget.updater != null) {
+      updater = widget.updater!;
+    } else {
+      _ownsUpdater = true;
+      updater = useNative ? AppUpdaterController() : AppUpdaterController.disabled();
+    }
+    updater.addListener(_refresh);
+    if (useNative) {
+      unawaited(updater.initVersion());
+      unawaited(
+        Future<void>.delayed(const Duration(seconds: 3), () async {
+          if (!mounted || controller.call != null) return;
+          await updater.checkForUpdates(silent: true);
+        }),
+      );
+    }
   }
 
   @override
   void dispose() {
+    updater.removeListener(_refresh);
+    if (_ownsUpdater) updater.dispose();
     controller
       ..removeListener(_refresh)
       ..dispose();
@@ -93,9 +119,23 @@ class _HomeShellState extends State<HomeShell> {
                           controller.simulateIncoming(aiTransfer: false);
                         case 'sim_ai':
                           controller.simulateIncoming(aiTransfer: true);
+                        case 'check_update':
+                          await showUpdateSheet(
+                            context,
+                            updater: updater,
+                            isInCall: () => controller.call != null,
+                          );
                       }
                     },
                     itemBuilder: (context) => [
+                      PopupMenuItem(
+                        value: 'check_update',
+                        child: Text(
+                          updater.hasUpdate
+                              ? '发现新版本 v${updater.availableRelease!.version}'
+                              : '检查应用更新（v${updater.currentVersion}）',
+                        ),
+                      ),
                       if (!controller.demoMode || controller.accounts.isNotEmpty)
                         PopupMenuItem(
                           value: 'toggle_demo',
@@ -124,21 +164,67 @@ class _HomeShellState extends State<HomeShell> {
                 ),
               ),
             ),
-      body: IndexedStack(
-        index: tab,
+      body: Column(
         children: [
-          DialerPage(
-            controller: controller,
-            onOpenNumbers: _openNumbers,
-          ),
-          HistoryPage(
-            controller: controller,
-            onSelectNumber: _selectNumber,
-            onClear: controller.clearHistory,
-          ),
-          NumbersPage(
-            controller: controller,
-            onDialWithNumber: _openDialer,
+          if (updater.hasUpdate && !_updateBannerDismissed)
+            SafeArea(
+              bottom: false,
+              top: tab == 0,
+              child: Material(
+                color: Theme.of(context).colorScheme.primaryContainer,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.system_update_outlined, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '发现新版本 v${updater.availableRelease!.version}',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => showUpdateSheet(
+                          context,
+                          updater: updater,
+                          isInCall: () => controller.call != null,
+                        ),
+                        child: const Text('升级'),
+                      ),
+                      IconButton(
+                        tooltip: '稍后提醒',
+                        icon: const Icon(Icons.close, size: 18),
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => setState(() => _updateBannerDismissed = true),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          Expanded(
+            child: IndexedStack(
+              index: tab,
+              children: [
+                DialerPage(
+                  controller: controller,
+                  onOpenNumbers: _openNumbers,
+                ),
+                HistoryPage(
+                  controller: controller,
+                  onSelectNumber: _selectNumber,
+                  onClear: controller.clearHistory,
+                ),
+                NumbersPage(
+                  controller: controller,
+                  onDialWithNumber: _openDialer,
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -158,11 +244,11 @@ class _HomeShellState extends State<HomeShell> {
           ),
           NavigationDestination(
             icon: Badge(
-              isLabelVisible: controller.needsBinding,
+              isLabelVisible: controller.needsBinding || updater.hasUpdate,
               child: const Icon(Icons.layers_outlined),
             ),
             selectedIcon: Badge(
-              isLabelVisible: controller.needsBinding,
+              isLabelVisible: controller.needsBinding || updater.hasUpdate,
               child: const Icon(Icons.layers),
             ),
             label: '号码',

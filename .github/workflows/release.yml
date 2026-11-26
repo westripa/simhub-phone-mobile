@@ -63,18 +63,53 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          RAW_VER="${VERSION#v}"
+          if [[ "$RAW_VER" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            BUILD_NAME="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            BUILD_NUMBER=$(( ${BASH_REMATCH[1]} * 10000 + ${BASH_REMATCH[2]} * 100 + ${BASH_REMATCH[3]} ))
+          else
+            BUILD_NAME="0.2.0"
+            BUILD_NUMBER=200
+          fi
           SIGNED_SUFFIX="debug-signed"
           if [ -n "$KEYSTORE_B64" ]; then
             printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
             export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
             SIGNED_SUFFIX="signed"
           fi
-          flutter build apk --release --target-platform android-arm64 -PabiFilters=arm64-v8a
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            -PabiFilters=arm64-v8a \
+            --build-name="$BUILD_NAME" \
+            --build-number="$BUILD_NUMBER"
           mkdir -p release-assets
-          cp build/app/outputs/flutter-apk/app-release.apk "release-assets/SimHub-Phone-${VERSION}-arm64-${SIGNED_SUFFIX}.apk"
+          APK_NAME="SimHub-Phone-${VERSION}-arm64-${SIGNED_SUFFIX}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "release-assets/${APK_NAME}"
           cp LICENSE release-assets/LICENSE.txt
           cp THIRD_PARTY_NOTICES.md release-assets/THIRD_PARTY_NOTICES.md
-          (cd release-assets && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          (
+            cd release-assets
+            sha256sum *.apk > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+            APK_SHA256="$(sha256sum "${APK_NAME}" | awk '{print $1}')"
+            APK_SIZE="$(wc -c < "${APK_NAME}")"
+            PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            python3 - <<PY > latest.json
+import json
+print(json.dumps({
+    "version": "${BUILD_NAME}",
+    "tag": "${VERSION}",
+    "build_number": ${BUILD_NUMBER},
+    "pub_date": "${PUB_DATE}",
+    "notes": "SimHub Phone Android ${VERSION}",
+    "apk_name": "${APK_NAME}",
+    "apk_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${APK_NAME}",
+    "sha256": "${APK_SHA256}",
+    "size": ${APK_SIZE},
+}, indent=2))
+PY
+            cat latest.json
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: android-arm64-apk
