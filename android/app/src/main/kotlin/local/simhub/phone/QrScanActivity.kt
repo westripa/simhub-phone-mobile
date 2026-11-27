@@ -80,6 +80,9 @@ class QrScanActivity : Activity() {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    private var previewSurface: Surface? = null
+    @Volatile
+    private var cameraClosingOrPaused: Boolean = false
     private var previewSize: Size = Size(1280, 720)
     private var zoomRange: Range<Float>? = null
     private var lastDecodeAtMs: Long = 0L
@@ -110,6 +113,7 @@ class QrScanActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        cameraClosingOrPaused = false
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             return
@@ -123,9 +127,17 @@ class QrScanActivity : Activity() {
     }
 
     override fun onPause() {
+        cameraClosingOrPaused = true
         closeCamera()
         stopBackgroundThread()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        cameraClosingOrPaused = true
+        closeCamera()
+        stopBackgroundThread()
+        super.onDestroy()
     }
 
     override fun onRequestPermissionsResult(
@@ -179,6 +191,7 @@ class QrScanActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun openCamera(viewWidth: Int, viewHeight: Int) {
+        if (cameraClosingOrPaused || isFinishing || isDestroyed) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             return
         }
@@ -217,19 +230,25 @@ class QrScanActivity : Activity() {
                 cameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
+                        if (cameraClosingOrPaused || isFinishing || isDestroyed) {
+                            runCatching { camera.close() }
+                            return
+                        }
                         cameraDevice = camera
                         createPreviewSession(camera, reader.surface)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        cameraDevice = null
+                        runCatching { camera.close() }
+                        if (cameraDevice === camera) cameraDevice = null
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        cameraDevice = null
-                        finish()
+                        runCatching { camera.close() }
+                        if (cameraDevice === camera) cameraDevice = null
+                        if (!isFinishing && !isDestroyed) {
+                            finish()
+                        }
                     }
                 },
                 cameraHandler,
@@ -242,41 +261,70 @@ class QrScanActivity : Activity() {
 
     @Suppress("DEPRECATION")
     private fun createPreviewSession(camera: CameraDevice, readerSurface: Surface) {
-        val texture = textureView.surfaceTexture ?: return
-        texture.setDefaultBufferSize(previewSize.width, previewSize.height)
-        val previewSurface = Surface(texture)
-
-        val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(previewSurface)
-            addTarget(readerSurface)
-            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                zoomRange?.let { range ->
-                    val target = 1.5f.coerceIn(range.lower, range.upper)
-                    set(CaptureRequest.CONTROL_ZOOM_RATIO, target)
-                }
-            }
+        if (cameraClosingOrPaused || isFinishing || isDestroyed || !textureView.isAvailable || !readerSurface.isValid) {
+            runCatching { camera.close() }
+            if (cameraDevice === camera) cameraDevice = null
+            return
         }
+        val texture = textureView.surfaceTexture ?: return
+        var localSurface: Surface? = null
+        runCatching {
+            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            localSurface = Surface(texture)
+            val surface = localSurface ?: return
+            if (!surface.isValid || cameraClosingOrPaused || isFinishing || isDestroyed) {
+                surface.release()
+                runCatching { camera.close() }
+                if (cameraDevice === camera) cameraDevice = null
+                return
+            }
+            previewSurface?.release()
+            previewSurface = surface
 
-        camera.createCaptureSession(
-            listOf(previewSurface, readerSurface),
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    if (cameraDevice == null) return
-                    captureSession = session
-                    runCatching {
-                        session.setRepeatingRequest(builder.build(), null, cameraHandler)
+            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                addTarget(readerSurface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    zoomRange?.let { range ->
+                        val target = 1.5f.coerceIn(range.lower, range.upper)
+                        set(CaptureRequest.CONTROL_ZOOM_RATIO, target)
                     }
                 }
+            }
 
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    setResult(RESULT_CANCELED)
-                    finish()
-                }
-            },
-            cameraHandler,
-        )
+            camera.createCaptureSession(
+                listOf(surface, readerSurface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        if (cameraClosingOrPaused || cameraDevice == null || isFinishing || isDestroyed) {
+                            runCatching { session.close() }
+                            return
+                        }
+                        captureSession = session
+                        runCatching {
+                            session.setRepeatingRequest(builder.build(), null, cameraHandler)
+                        }
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        runCatching { session.close() }
+                        if (!isFinishing && !isDestroyed) {
+                            setResult(RESULT_CANCELED)
+                            finish()
+                        }
+                    }
+                },
+                cameraHandler,
+            )
+        }.onFailure { err ->
+            Log.w(TAG, "createPreviewSession aborted: ${err.message}")
+            runCatching { localSurface?.release() }
+            if (previewSurface === localSurface) previewSurface = null
+            runCatching { camera.close() }
+            if (cameraDevice === camera) cameraDevice = null
+        }
     }
 
     private fun closeCamera() {
@@ -286,6 +334,8 @@ class QrScanActivity : Activity() {
         cameraDevice = null
         runCatching { imageReader?.close() }
         imageReader = null
+        runCatching { previewSurface?.release() }
+        previewSurface = null
     }
 
     private fun tryDecodeImage(image: Image) {

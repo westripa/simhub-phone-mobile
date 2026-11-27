@@ -32,12 +32,19 @@ data class StoredSipAccount(
     val isDefault: Boolean,
     val allowSelfSignedTls: Boolean,
     val nullAudio: Boolean,
+    val multiplex: Boolean = false,
 ) {
     val displayNumber: String
         get() = phoneNumber.ifBlank { username }
 
     val hasCredential: Boolean
         get() = ha1.isNotBlank() || password.isNotBlank()
+
+    fun sipTransportKey(): String = if (multiplex) {
+        "mux|$username|$authUsername|$domain|$realm|$registrarUri|$transport|$srtp|$allowSelfSignedTls"
+    } else {
+        accountKey
+    }
 
     fun configSignature(): String = listOf(
         username,
@@ -51,6 +58,7 @@ data class StoredSipAccount(
         password,
         registrationExpiresSec.toString(),
         allowSelfSignedTls.toString(),
+        multiplex.toString(),
     ).joinToString("|")
 
     fun toFlutterMap(registrationState: String, reason: String?): Map<String, Any?> = mapOf(
@@ -68,6 +76,7 @@ data class StoredSipAccount(
         "enabled" to enabled,
         "is_default" to isDefault,
         "has_credential" to hasCredential,
+        "multiplex" to multiplex,
         "registration" to registrationState,
         "reason" to reason,
     )
@@ -172,8 +181,10 @@ internal object PhoneAccountStore {
         val registrar = raw["registrar_uri"]?.toString()?.trim().orEmpty()
         if (username.isBlank() || domain.isBlank() || registrar.isBlank()) return null
 
+        val phoneNumber = raw["phone_number"]?.toString()?.trim().orEmpty()
+        val multiplex = raw["multiplex"] == true
         val key = raw["account_key"]?.toString()?.trim()?.ifBlank { null }
-            ?: "$username@$domain"
+            ?: if (multiplex && phoneNumber.isNotBlank()) "$username@$domain#$phoneNumber" else "$username@$domain"
         val transport = raw["transport"]?.toString()?.trim()?.lowercase()
             ?.takeIf { it == "tls" || it == "tcp" || it == "udp" } ?: "tls"
         val srtp = raw["srtp"]?.toString()?.trim()?.lowercase()
@@ -186,7 +197,7 @@ internal object PhoneAccountStore {
             accountKey = key,
             username = username,
             authUsername = raw["auth_username"]?.toString()?.trim().orEmpty(),
-            phoneNumber = raw["phone_number"]?.toString()?.trim().orEmpty(),
+            phoneNumber = phoneNumber,
             domain = domain,
             realm = raw["realm"]?.toString()?.trim().orEmpty(),
             registrarUri = registrar,
@@ -201,6 +212,7 @@ internal object PhoneAccountStore {
             isDefault = raw["is_default"] == true,
             allowSelfSignedTls = raw["allow_self_signed_tls"] == true,
             nullAudio = raw["null_audio"] == true,
+            multiplex = multiplex,
         )
     }
 
@@ -242,6 +254,7 @@ internal object PhoneAccountStore {
                     isDefault = obj.optBoolean("is_default", false),
                     allowSelfSignedTls = obj.optBoolean("allow_self_signed_tls", false),
                     nullAudio = obj.optBoolean("null_audio", false),
+                    multiplex = obj.optBoolean("multiplex", false),
                 ),
             )
         }
@@ -268,6 +281,7 @@ internal object PhoneAccountStore {
                 put("is_default", acc.isDefault)
                 put("allow_self_signed_tls", acc.allowSelfSignedTls)
                 put("null_audio", acc.nullAudio)
+                put("multiplex", acc.multiplex)
                 put("secret", encryptSecret(acc.ha1, acc.password))
             }
             array.put(obj)

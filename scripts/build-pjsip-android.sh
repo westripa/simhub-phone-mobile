@@ -133,7 +133,13 @@ build_abi() {
 #define PJMEDIA_HAS_SRTP 1
 #define PJMEDIA_HAS_VIDEO 0
 #define PJSIP_MAX_PKT_LEN 8192
+#define PJSUA_MAX_ACC 128
+#define PJ_IOQUEUE_MAX_HANDLES 256
 #include <pj/config_site_sample.h>
+#undef PJSUA_MAX_ACC
+#define PJSUA_MAX_ACC 128
+#undef PJ_IOQUEUE_MAX_HANDLES
+#define PJ_IOQUEUE_MAX_HANDLES 256
 EOF
 
   pushd "$pj_src" >/dev/null

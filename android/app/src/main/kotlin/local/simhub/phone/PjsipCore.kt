@@ -18,6 +18,8 @@ import org.pjsip.pjsua2.OnCallTsxStateParam
 import org.pjsip.pjsua2.OnIncomingCallParam
 import org.pjsip.pjsua2.OnRegStateParam
 import org.pjsip.pjsua2.SipEvent
+import org.pjsip.pjsua2.SipHeader
+import org.pjsip.pjsua2.SipHeaderVector
 import org.pjsip.pjsua2.TlsConfig
 import org.pjsip.pjsua2.TransportConfig
 import org.pjsip.pjsua2.LogEntry
@@ -56,6 +58,12 @@ private data class ManagedAccount(
  * incoming headers (`X-SimHub-Own-Number`, `X-SimHub-Transfer*`).
  */
 class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
+    companion object {
+        private const val MAX_LIVE_PJSIP_ACCOUNTS = 128
+        private const val REGISTER_WAVE_BATCH_SIZE = 4
+        private const val REGISTER_WAVE_INTERVAL_MS = 60L
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val logWriter = AndroidLogWriter()
 
@@ -67,6 +75,8 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
     private val managedAccounts = LinkedHashMap<String, ManagedAccount>()
     private val regStates = LinkedHashMap<String, String>()
     private val regReasons = LinkedHashMap<String, String?>()
+    private val capacityBlockedAccountKeys = mutableSetOf<String>()
+    private var regWaveGen = 0
 
     private val callLock = Any()
     private var activeCall: PjsipCall? = null
@@ -116,41 +126,71 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         }
 
         val desiredByKey = accounts.associateBy { it.accountKey }
-
-        // Tear down accounts removed, disabled, or changed in connection signature.
-        val keysToRemove = managedAccounts.keys.filter { key ->
-            val target = desiredByKey[key]
-            target == null || !target.enabled || !target.hasCredential ||
-                managedAccounts[key]?.signature != target.configSignature()
-        }
-        for (key in keysToRemove) {
-            val existing = managedAccounts.remove(key) ?: continue
-            destroyAccount(existing.account)
-            if (desiredByKey[key]?.enabled != true) {
-                regStates[key] = "unregistered"
-                regReasons[key] = null
-            }
-        }
-
-        // Update metadata on unchanged live accounts and create missing ones.
+        val enabledBySipKey = LinkedHashMap<String, MutableList<StoredSipAccount>>()
         for (acc in accounts) {
-            val key = acc.accountKey
-            val existing = managedAccounts[key]
-            if (existing != null) {
-                managedAccounts[key] = existing.copy(stored = acc)
-                continue
+            if (acc.enabled && acc.hasCredential) {
+                enabledBySipKey.getOrPut(acc.sipTransportKey()) { mutableListOf() }.add(acc)
             }
-            if (!acc.enabled || !acc.hasCredential || endpoint == null) {
-                regStates[key] = "unregistered"
-                regReasons[key] = if (!acc.hasCredential && acc.enabled) "缺少凭据" else null
-                continue
-            }
-            createManagedAccount(acc, registerNow)
         }
 
-        // Clean stale reg states for deleted accounts.
+        // Tear down transport accounts removed, disabled, or changed in connection signature.
+        val keysToRemove = managedAccounts.keys.filter { sipKey ->
+            val group = enabledBySipKey[sipKey]
+            group == null || managedAccounts[sipKey]?.signature != group.first().configSignature()
+        }
+        for (sipKey in keysToRemove) {
+            val existing = managedAccounts.remove(sipKey) ?: continue
+            destroyAccount(existing.account)
+        }
+
+        // Clean stale per-UI-account states for deleted accounts.
         regStates.keys.retainAll(desiredByKey.keys)
         regReasons.keys.retainAll(desiredByKey.keys)
+        capacityBlockedAccountKeys.retainAll(desiredByKey.keys)
+
+        for (acc in accounts) {
+            if (!acc.enabled || !acc.hasCredential || endpoint == null) {
+                capacityBlockedAccountKeys.remove(acc.accountKey)
+                regStates[acc.accountKey] = "unregistered"
+                regReasons[acc.accountKey] = if (!acc.hasCredential && acc.enabled) "缺少凭据" else null
+            }
+        }
+
+        val toRegisterKeys = mutableListOf<String>()
+        if (endpoint != null) {
+            for ((sipKey, group) in enabledBySipKey) {
+                val representative = group.first()
+                val existing = managedAccounts[sipKey]
+                if (existing != null) {
+                    managedAccounts[sipKey] = existing.copy(stored = representative)
+                    val sharedState = group.mapNotNull { regStates[it.accountKey] }
+                        .firstOrNull { it == "registered" || it == "registering" }
+                        ?: group.mapNotNull { regStates[it.accountKey] }.firstOrNull()
+                        ?: "unregistered"
+                    val sharedReason = if (sharedState == "failed") {
+                        group.mapNotNull { regReasons[it.accountKey] }.firstOrNull()
+                    } else {
+                        null
+                    }
+                    for (member in group) {
+                        capacityBlockedAccountKeys.remove(member.accountKey)
+                        regStates[member.accountKey] = sharedState
+                        regReasons[member.accountKey] = sharedReason
+                    }
+                    if (registerNow && sharedState != "registered" && sharedState != "registering") {
+                        toRegisterKeys.add(sipKey)
+                    }
+                    continue
+                }
+                if (createManagedAccount(sipKey, representative, group) && registerNow) {
+                    toRegisterKeys.add(sipKey)
+                }
+            }
+        }
+
+        if (toRegisterKeys.isNotEmpty()) {
+            scheduleRegisterWave(toRegisterKeys)
+        }
 
         emitAccountsSnapshot()
         emitAggregateRegistration()
@@ -181,33 +221,28 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         main.removeCallbacks(retryRunnable)
         retryScheduled = false
         retryAttempt = 0
-        for ((key, managed) in managedAccounts.toMap()) {
-            if (!managed.stored.enabled) continue
-            if (regStates[key] == "registering") continue
-            runCatching {
-                managed.account.setRegistration(true)
-                regStates[key] = "registering"
-                regReasons[key] = null
-            }.onFailure { err ->
-                val msg = err.message.orEmpty()
-                if (msg.contains("PJSIP_EBUSY") || msg.contains("171001")) {
-                    Log.i("PjsipCore", "registration already in flight for account=${maskId(key)}")
-                    regStates[key] = "registering"
-                } else {
-                    managedAccounts.remove(key)
-                    destroyAccount(managed.account)
-                    createManagedAccount(managed.stored, registerNow = true)
-                    if (regStates[key] == "failed" && regReasons[key].isNullOrBlank()) {
-                        regReasons[key] = err.message
-                    }
+        val enabledBySipKey = LinkedHashMap<String, MutableList<StoredSipAccount>>()
+        for (acc in storedOrder) {
+            if (acc.enabled && acc.hasCredential) {
+                enabledBySipKey.getOrPut(acc.sipTransportKey()) { mutableListOf() }.add(acc)
+            }
+        }
+        val toRegisterKeys = mutableListOf<String>()
+        for ((sipKey, group) in enabledBySipKey) {
+            val managed = managedAccounts[sipKey]
+            if (managed == null) {
+                if (createManagedAccount(sipKey, group.first(), group)) {
+                    toRegisterKeys.add(sipKey)
+                }
+            } else {
+                val alreadyInFlight = group.all { regStates[it.accountKey] == "registering" }
+                if (!alreadyInFlight) {
+                    toRegisterKeys.add(sipKey)
                 }
             }
         }
-        for (acc in storedOrder) {
-            if (!acc.enabled || !acc.hasCredential || managedAccounts.containsKey(acc.accountKey)) {
-                continue
-            }
-            createManagedAccount(acc, registerNow = true)
+        if (toRegisterKeys.isNotEmpty()) {
+            scheduleRegisterWave(toRegisterKeys)
         }
         emitAccountsSnapshot()
         emitAggregateRegistration()
@@ -232,49 +267,113 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         if (needActiveEndpoint && endpoint == null) {
             ensureEndpoint(nullAudio = anyNullAudio, allowSelfSignedTls = anySelfSigned)
         }
-        var changed = false
+        val enabledBySipKey = LinkedHashMap<String, MutableList<StoredSipAccount>>()
         for (acc in snapshot) {
-            if (!acc.enabled || !acc.hasCredential) continue
-            val key = acc.accountKey
-            val currentState = regStates[key]
-            if (currentState == "registered" || currentState == "registering") continue
-            val managed = managedAccounts[key]
+            if (acc.enabled && acc.hasCredential) {
+                enabledBySipKey.getOrPut(acc.sipTransportKey()) { mutableListOf() }.add(acc)
+            }
+        }
+        var changed = false
+        val toRegisterKeys = mutableListOf<String>()
+        for ((sipKey, group) in enabledBySipKey) {
+            val allActiveOrInFlight = group.all {
+                val s = regStates[it.accountKey]
+                s == "registered" || s == "registering"
+            }
+            if (allActiveOrInFlight) continue
+            val managed = managedAccounts[sipKey]
             if (managed == null) {
-                createManagedAccount(acc, registerNow = true)
-                changed = true
-            } else {
-                runCatching {
-                    managed.account.setRegistration(true)
-                    regStates[key] = "registering"
-                    regReasons[key] = null
-                }.onFailure { err ->
-                    val msg = err.message.orEmpty()
-                    if (msg.contains("PJSIP_EBUSY") || msg.contains("171001")) {
-                        Log.i("PjsipCore", "registration already in flight for account=${maskId(key)}")
-                        regStates[key] = "registering"
-                    } else {
-                        managedAccounts.remove(key)
-                        destroyAccount(managed.account)
-                        createManagedAccount(acc, registerNow = true)
-                    }
+                if (createManagedAccount(sipKey, group.first(), group)) {
+                    toRegisterKeys.add(sipKey)
                 }
                 changed = true
+            } else {
+                toRegisterKeys.add(sipKey)
+                changed = true
             }
+        }
+        if (toRegisterKeys.isNotEmpty()) {
+            scheduleRegisterWave(toRegisterKeys)
         }
         if (changed) {
             emitAccountsSnapshot()
             emitAggregateRegistration()
         }
-        if (snapshot.any { it.enabled && it.hasCredential && regStates[it.accountKey] != "registered" }) {
+        if (hasRetryableUnregisteredAccounts(snapshot)) {
             scheduleRetryIfNeeded()
         }
     }
 
-    private fun scheduleRetryIfNeeded() {
-        val needsRetry = storedOrder.any {
-            it.enabled && it.hasCredential && regStates[it.accountKey] != "registered"
+    private fun hasRetryableUnregisteredAccounts(list: List<StoredSipAccount> = storedOrder): Boolean =
+        list.any {
+            it.enabled &&
+                it.hasCredential &&
+                !capacityBlockedAccountKeys.contains(it.accountKey) &&
+                regStates[it.accountKey] != "registered"
         }
-        if (!needsRetry) {
+
+    private fun scheduleRegisterWave(sipKeys: List<String>) {
+        val uniqueKeys = sipKeys.distinct().filter { managedAccounts.containsKey(it) }
+        val gen = ++regWaveGen
+        if (uniqueKeys.isEmpty()) return
+        for (sipKey in uniqueKeys) {
+            for (acc in storedOrder) {
+                if (acc.enabled && acc.hasCredential && acc.sipTransportKey() == sipKey &&
+                    regStates[acc.accountKey] != "registered"
+                ) {
+                    regStates[acc.accountKey] = "registering"
+                    regReasons[acc.accountKey] = null
+                }
+            }
+        }
+        val batches = uniqueKeys.chunked(REGISTER_WAVE_BATCH_SIZE)
+        for ((batchIdx, batch) in batches.withIndex()) {
+            main.postDelayed({
+                if (gen != regWaveGen || endpoint == null) return@postDelayed
+                ensurePjThread("main")
+                var snapshotChanged = false
+                for (sipKey in batch) {
+                    val managed = managedAccounts[sipKey] ?: continue
+                    runCatching {
+                        managed.account.setRegistration(true)
+                    }.onFailure { err ->
+                        val msg = err.message.orEmpty()
+                        if (msg.contains("PJSIP_EBUSY") || msg.contains("171001")) {
+                            Log.i("PjsipCore", "registration already in flight for account=${maskId(sipKey)}")
+                        } else {
+                            managedAccounts.remove(sipKey)
+                            destroyAccount(managed.account)
+                            val group = storedOrder.filter {
+                                it.enabled && it.hasCredential && it.sipTransportKey() == sipKey
+                            }
+                            if (group.isNotEmpty() && createManagedAccount(sipKey, group.first(), group)) {
+                                runCatching { managedAccounts[sipKey]?.account?.setRegistration(true) }
+                                    .onFailure { retryErr ->
+                                        for (m in group) {
+                                            regStates[m.accountKey] = "failed"
+                                            regReasons[m.accountKey] = retryErr.message ?: msg
+                                        }
+                                    }
+                            } else {
+                                for (m in group) {
+                                    regStates[m.accountKey] = "failed"
+                                    regReasons[m.accountKey] = msg.ifBlank { "账号注册失败" }
+                                }
+                            }
+                            snapshotChanged = true
+                        }
+                    }
+                }
+                if (snapshotChanged) {
+                    emitAccountsSnapshot()
+                    emitAggregateRegistration()
+                }
+            }, batchIdx * REGISTER_WAVE_INTERVAL_MS)
+        }
+    }
+
+    private fun scheduleRetryIfNeeded() {
+        if (!hasRetryableUnregisteredAccounts()) {
             main.removeCallbacks(retryRunnable)
             retryScheduled = false
             retryAttempt = 0
@@ -290,13 +389,16 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
 
     fun unregisterAll() {
         ensurePjThread("main")
+        regWaveGen++
         main.removeCallbacks(retryRunnable)
         retryScheduled = false
         retryAttempt = 0
-        for ((key, managed) in managedAccounts) {
+        for ((_, managed) in managedAccounts) {
             runCatching { managed.account.setRegistration(false) }
-            regStates[key] = "unregistered"
-            regReasons[key] = null
+        }
+        for (acc in storedOrder) {
+            regStates[acc.accountKey] = "unregistered"
+            regReasons[acc.accountKey] = null
         }
         emitAccountsSnapshot()
         emitAggregateRegistration()
@@ -314,9 +416,8 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         synchronized(callLock) {
             if (activeCall != null) error("当前已有通话正在进行")
         }
-        val targetAccount = selectDialAccount(accountKey)
+        val (cfg, targetAccount) = selectDialAccount(accountKey)
             ?: error("没有可用的已注册 SIP 号码")
-        val cfg = targetAccount.stored
         val cleanTarget = number.trim()
         val destination = if (cleanTarget.startsWith("sip:")) {
             cleanTarget
@@ -338,6 +439,15 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
             activeCall = call
         }
         val param = CallOpParam(true)
+        if (cfg.multiplex && cfg.phoneNumber.isNotBlank()) {
+            val fromHdr = SipHeader().apply {
+                hName = "X-SimHub-From-Number"
+                hValue = cfg.phoneNumber.trim()
+            }
+            val headers = param.txOption.headers ?: SipHeaderVector()
+            headers.add(fromHdr)
+            param.txOption.headers = headers
+        }
         try {
             call.makeCall(destination, param)
         } catch (error: Exception) {
@@ -528,18 +638,18 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         synchronized(callLock) { activeCall?.takeIf { !it.disconnected } }?.dialDtmf(digit)
     }
 
-    internal fun onRegState(accountKey: String, prm: OnRegStateParam) {
+    internal fun onRegState(sipKey: String, prm: OnRegStateParam) {
         val code = prm.code
         val reason = prm.reason.trim()
         val registered = code == 200
         Log.i(
             "PjsipCore",
-            "reg state account=${maskId(accountKey)} code=$code",
+            "reg state account=${maskId(sipKey)} code=$code",
         )
         main.post {
-            if (!managedAccounts.containsKey(accountKey)) return@post
-            regStates[accountKey] = if (registered) "registered" else "failed"
-            regReasons[accountKey] = if (registered) {
+            if (!managedAccounts.containsKey(sipKey)) return@post
+            val nextState = if (registered) "registered" else "failed"
+            val nextReason = if (registered) {
                 null
             } else {
                 listOfNotNull(
@@ -547,12 +657,15 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
                     reason.takeIf { it.isNotEmpty() },
                 ).joinToString(" ").ifBlank { "注册失败" }
             }
+            for (acc in storedOrder) {
+                if (acc.enabled && acc.hasCredential && acc.sipTransportKey() == sipKey) {
+                    regStates[acc.accountKey] = nextState
+                    regReasons[acc.accountKey] = nextReason
+                }
+            }
             emitAccountsSnapshot()
             emitAggregateRegistration(code = code, reason = reason)
-            val needsRetry = storedOrder.any {
-                it.enabled && it.hasCredential && regStates[it.accountKey] != "registered"
-            }
-            if (!needsRetry) {
+            if (!hasRetryableUnregisteredAccounts()) {
                 main.removeCallbacks(retryRunnable)
                 retryScheduled = false
                 retryAttempt = 0
@@ -562,14 +675,14 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         }
     }
 
-    internal fun onIncomingCall(accountKey: String, prm: OnIncomingCallParam) {
-        val managed = managedAccounts[accountKey] ?: return
+    internal fun onIncomingCall(sipKey: String, prm: OnIncomingCallParam) {
+        val managed = managedAccounts[sipKey] ?: return
         val isBusy = synchronized(callLock) { activeCall != null }
         if (isBusy) {
             // Single-call mic exclusivity: immediately reject secondary calls with 486 Busy Here.
             var busyCall: PjsipCall? = null
             runCatching {
-                busyCall = PjsipCall(this, managed.account, accountKey, prm.callId, incoming = true)
+                busyCall = PjsipCall(this, managed.account, sipKey, prm.callId, incoming = true)
                 val busyParam = CallOpParam(true)
                 busyParam.statusCode = pjsip_status_code.PJSIP_SC_BUSY_HERE
                 busyCall?.answer(busyParam)
@@ -587,17 +700,18 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         val headers = parseHeaders(prm.rdata?.wholeMsg.orEmpty())
         val headerLineId = headers["x-simhub-line-id"]?.takeIf { it.isNotBlank() }
         val headerPeer = headers["x-simhub-peer-number"]?.takeIf { it.isNotBlank() }
-        val ownNum = headers["x-simhub-own-number"]?.takeIf { it.isNotBlank() }
-            ?: managed.stored.displayNumber
+        val headerOwn = headers["x-simhub-own-number"]?.takeIf { it.isNotBlank() }
+        val matchedStored = resolveInboundStoredAccount(sipKey, headerOwn) ?: managed.stored
+        val ownNum = headerOwn ?: matchedStored.displayNumber
         val transferSrc = headers["x-simhub-transfer"]?.takeIf { it.isNotBlank() }
         val transferReason = headers["x-simhub-transfer-reason"]?.takeIf { it.isNotBlank() }
         val gatewayCallId = headers["x-simhub-call-id"]?.takeIf { it.isNotBlank() }
 
-        val call = PjsipCall(this, managed.account, accountKey, prm.callId, incoming = true).apply {
+        val call = PjsipCall(this, managed.account, matchedStored.accountKey, prm.callId, incoming = true).apply {
             phase = "incoming"
             peer = headerPeer.orEmpty()
             ownNumber = ownNum
-            lineLabel = managed.stored.label.ifBlank { ownNum }
+            lineLabel = matchedStored.label.ifBlank { ownNum }
             lineId = headerLineId
             transferSource = transferSrc
             this.transferReason = transferReason
@@ -758,6 +872,7 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
 
     private fun shutdownEndpointOnly() {
         ensurePjThread("main")
+        regWaveGen++
         main.removeCallbacks(retryRunnable)
         retryScheduled = false
         retryAttempt = 0
@@ -872,12 +987,27 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         Log.i("PjsipCore", "PJSIP started verifyServer=$endpointVerifyServer")
     }
 
-    private fun createManagedAccount(acc: StoredSipAccount, registerNow: Boolean) {
+    private fun createManagedAccount(
+        sipKey: String,
+        acc: StoredSipAccount,
+        group: List<StoredSipAccount>,
+    ): Boolean {
+        if (managedAccounts.size >= MAX_LIVE_PJSIP_ACCOUNTS) {
+            val reason = "超过客户端并发账号上限 ($MAX_LIVE_PJSIP_ACCOUNTS)"
+            for (member in group) {
+                capacityBlockedAccountKeys.add(member.accountKey)
+                regStates[member.accountKey] = "failed"
+                regReasons[member.accountKey] = reason
+            }
+            Log.w("PjsipCore", "skipped creating account=${maskId(sipKey)}: reached limit $MAX_LIVE_PJSIP_ACCOUNTS")
+            return false
+        }
+
         val registrar = normalizeRegistrar(acc.registrarUri, acc.transport)
         val accountConfig = AccountConfig()
         accountConfig.idUri = "sip:${acc.username}@${acc.domain}"
         accountConfig.regConfig.registrarUri = registrar
-        accountConfig.regConfig.registerOnAdd = registerNow
+        accountConfig.regConfig.registerOnAdd = false
         accountConfig.regConfig.setTimeoutSec(acc.registrationExpiresSec.toLong())
         // Retries are owned solely by PjsipCore's backoff scheduler and network callbacks;
         // disabling PJSIP's internal failure retry avoids overlapping REGISTER PJSIP_EBUSY errors.
@@ -914,36 +1044,57 @@ class PjsipCore(private val emitEvent: (Map<String, Any?>) -> Unit) {
         accountConfig.mediaConfig.setSrtpUse(srtpUse)
         accountConfig.mediaConfig.setSrtpSecureSignaling(0)
 
-        val pjAcc = PjsipAccount(this, acc.accountKey)
-        try {
-            pjAcc.create(accountConfig, true)
-            managedAccounts[acc.accountKey] = ManagedAccount(acc, acc.configSignature(), pjAcc)
-            regStates[acc.accountKey] = if (registerNow) "registering" else "unregistered"
-            regReasons[acc.accountKey] = null
+        val pjAcc = PjsipAccount(this, sipKey)
+        return try {
+            pjAcc.create(accountConfig, false)
+            managedAccounts[sipKey] = ManagedAccount(acc, acc.configSignature(), pjAcc)
+            for (member in group) {
+                capacityBlockedAccountKeys.remove(member.accountKey)
+                regStates[member.accountKey] = "unregistered"
+                regReasons[member.accountKey] = null
+            }
+            true
         } catch (err: Exception) {
             destroyAccount(pjAcc)
-            regStates[acc.accountKey] = "failed"
-            regReasons[acc.accountKey] = err.message ?: "账号注册初始化失败"
-            Log.e("PjsipCore", "account create failed account=${maskId(acc.accountKey)}")
+            for (member in group) {
+                regStates[member.accountKey] = "failed"
+                regReasons[member.accountKey] = err.message ?: "账号注册初始化失败"
+            }
+            Log.e("PjsipCore", "account create failed account=${maskId(sipKey)}")
             main.post { scheduleRetryIfNeeded() }
+            false
         }
     }
 
-    private fun selectDialAccount(accountKey: String?): ManagedAccount? {
+    private fun selectDialAccount(accountKey: String?): Pair<StoredSipAccount, ManagedAccount>? {
+        fun resolveRegistered(acc: StoredSipAccount?): Pair<StoredSipAccount, ManagedAccount>? {
+            if (acc == null || !acc.enabled) return null
+            if (regStates[acc.accountKey] != "registered") return null
+            val managed = managedAccounts[acc.sipTransportKey()] ?: return null
+            return acc to managed
+        }
         if (!accountKey.isNullOrBlank()) {
-            val explicit = managedAccounts[accountKey]
-            if (explicit != null && regStates[accountKey] == "registered") return explicit
+            resolveRegistered(storedOrder.firstOrNull { it.accountKey == accountKey })?.let { return it }
         }
-        val defaultStored = storedOrder.firstOrNull { it.isDefault }
-        if (defaultStored != null) {
-            val managed = managedAccounts[defaultStored.accountKey]
-            if (managed != null && regStates[defaultStored.accountKey] == "registered") {
-                return managed
-            }
+        resolveRegistered(storedOrder.firstOrNull { it.isDefault })?.let { return it }
+        for (acc in storedOrder) {
+            resolveRegistered(acc)?.let { return it }
         }
-        return managedAccounts.entries
-            .firstOrNull { regStates[it.key] == "registered" }
-            ?.value
+        return null
+    }
+
+    private fun resolveInboundStoredAccount(sipKey: String, ownNumber: String?): StoredSipAccount? {
+        val candidates = storedOrder.filter { it.sipTransportKey() == sipKey }
+        if (candidates.isEmpty()) return null
+        if (!ownNumber.isNullOrBlank()) {
+            val clean = ownNumber.trim()
+            val digits = clean.removePrefix("+")
+            candidates.firstOrNull {
+                val p = it.phoneNumber.trim()
+                p.isNotEmpty() && (p == clean || p.removePrefix("+") == digits)
+            }?.let { return it }
+        }
+        return candidates.firstOrNull { it.enabled } ?: candidates.first()
     }
 
     private fun normalizeRegistrar(raw: String, transport: String): String {

@@ -229,4 +229,42 @@ passwd=secret-pass
     expect(extractProvisioningBatchLines('<config></config>'), isNull);
     expect(extractProvisioningBatchLines('[auth_info_0]\nusername=+15550001'), isNull);
   });
+
+  test('device multiplex provisioning keeps distinct accountKeys for shared sip_username', () {
+    const jsonPayload = '''
+{
+  "mode": "device",
+  "sip_proxy": "<sip:sip.example.test:5061;transport=tls>;lr",
+  "accounts": [
+    {
+      "slot": 0,
+      "sip_username": "d_dev0123456789a",
+      "authorization_username": "d_dev0123456789a",
+      "number": "+15550001001",
+      "label": "主力卡1",
+      "domain": "sip.example.test",
+      "ha1": "0123456789abcdef0123456789abcdef",
+      "multiplex": true
+    },
+    {
+      "slot": 1,
+      "sip_username": "d_dev0123456789a",
+      "authorization_username": "d_dev0123456789a",
+      "number": "+15550001002",
+      "label": "主力卡2",
+      "domain": "sip.example.test",
+      "ha1": "0123456789abcdef0123456789abcdef",
+      "multiplex": true
+    }
+  ]
+}
+''';
+    final configs = parseProvisioningPayload(jsonPayload).toSipAccountConfigs();
+    expect(configs, hasLength(2));
+    expect(configs[0].multiplex, isTrue);
+    expect(configs[1].multiplex, isTrue);
+    expect(configs[0].accountKey, 'd_dev0123456789a@sip.example.test#+15550001001');
+    expect(configs[1].accountKey, 'd_dev0123456789a@sip.example.test#+15550001002');
+    expect(configs[0].toMap()['multiplex'], isTrue);
+  });
 }

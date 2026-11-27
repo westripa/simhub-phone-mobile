@@ -46,6 +46,7 @@ class SipAccountConfig {
     this.enabled = true,
     this.allowSelfSignedTls = false,
     this.nullAudio = false,
+    this.multiplex = false,
   });
 
   final String username;
@@ -64,8 +65,17 @@ class SipAccountConfig {
   final bool enabled;
   final bool allowSelfSignedTls;
   final bool nullAudio;
+  final bool multiplex;
 
-  String get accountKey => '${username.trim()}@${domain.trim()}';
+  String get accountKey {
+    final user = username.trim();
+    final dom = domain.trim();
+    final phone = phoneNumber.trim();
+    if (multiplex && phone.isNotEmpty) {
+      return '$user@$dom#$phone';
+    }
+    return '$user@$dom';
+  }
 
   Map<String, Object?> toMap() => {
         'account_key': accountKey,
@@ -85,6 +95,7 @@ class SipAccountConfig {
         'enabled': enabled,
         'allow_self_signed_tls': allowSelfSignedTls,
         'null_audio': nullAudio,
+        'multiplex': multiplex,
       };
 }
 
@@ -104,6 +115,7 @@ class CoreAccountState {
     this.enabled = true,
     this.isDefault = false,
     this.hasCredential = false,
+    this.multiplex = false,
     this.registration = CoreRegistration.unregistered,
     this.reason,
   });
@@ -122,6 +134,7 @@ class CoreAccountState {
   final bool enabled;
   final bool isDefault;
   final bool hasCredential;
+  final bool multiplex;
   final CoreRegistration registration;
   final String? reason;
 
@@ -162,6 +175,7 @@ class CoreAccountState {
     bool? enabled,
     bool? isDefault,
     bool? hasCredential,
+    bool? multiplex,
     CoreRegistration? registration,
     String? reason,
     bool clearReason = false,
@@ -181,6 +195,7 @@ class CoreAccountState {
       enabled: enabled ?? this.enabled,
       isDefault: isDefault ?? this.isDefault,
       hasCredential: hasCredential ?? this.hasCredential,
+      multiplex: multiplex ?? this.multiplex,
       registration: registration ?? this.registration,
       reason: clearReason ? null : (reason ?? this.reason),
     );
@@ -210,6 +225,7 @@ class CoreAccountState {
       enabled: map['enabled'] != false,
       isDefault: map['is_default'] == true,
       hasCredential: map['has_credential'] == true,
+      multiplex: map['multiplex'] == true,
       registration: reg,
       reason: rawReason.isEmpty ? null : rawReason,
     );

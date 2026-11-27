@@ -26,6 +26,7 @@ class ProvisionedAccountChoice {
     this.password,
     this.label,
     this.group,
+    this.multiplex = false,
   });
 
   final int slot;
@@ -38,6 +39,7 @@ class ProvisionedAccountChoice {
   final String? password;
   final String? label;
   final String? group;
+  final bool multiplex;
 }
 
 class BatchProvisioningSummary {
@@ -159,6 +161,7 @@ class ProvisioningImportResult {
             group: derivedGroup,
             enabled: true,
             allowSelfSignedTls: allowSelfSignedTls,
+            multiplex: acc.multiplex,
           );
         }(),
     ];
@@ -338,6 +341,9 @@ ProvisioningImportResult _parseJsonProvisioning(String raw) {
   final registrarUri = topProxy != null
       ? normalizeSipRegistrarUri(topProxy, transportHint: topTransport)
       : null;
+  final topMultiplex =
+      _cleanText(decoded['mode'])?.toLowerCase() == 'device' ||
+          decoded['multiplex'] == true;
 
   final choices = <ProvisionedAccountChoice>[];
   if (rawAccounts is List && rawAccounts.isNotEmpty) {
@@ -361,6 +367,7 @@ ProvisioningImportResult _parseJsonProvisioning(String raw) {
           password: _nonEmptyRaw(item['password']),
           label: _cleanText(item['label'] ?? decoded['label']),
           group: _cleanText(item['group']),
+          multiplex: topMultiplex || item['multiplex'] == true,
         ),
       );
     }
@@ -382,6 +389,7 @@ ProvisioningImportResult _parseJsonProvisioning(String raw) {
           password: _nonEmptyRaw(decoded['password']),
           label: _cleanText(decoded['label']),
           group: _cleanText(decoded['group']),
+          multiplex: topMultiplex,
         ),
       );
     }

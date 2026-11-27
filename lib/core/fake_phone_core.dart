@@ -26,6 +26,7 @@ class FakePhoneCore implements PhoneCore {
             enabled: cfg.enabled,
             isDefault: i == 0,
             hasCredential: _hasSecret(cfg),
+            multiplex: cfg.multiplex,
             registration: cfg.enabled
                 ? CoreRegistration.registered
                 : CoreRegistration.unregistered,
@@ -135,6 +136,7 @@ class FakePhoneCore implements PhoneCore {
           group: normalizeAccountGroup(cfg.group),
           enabled: cfg.enabled,
           hasCredential: existing.hasCredential || _hasSecret(cfg),
+          multiplex: cfg.multiplex,
           registration: nextReg,
           clearReason: true,
         );
@@ -155,6 +157,7 @@ class FakePhoneCore implements PhoneCore {
             enabled: cfg.enabled,
             isDefault: _accounts.isEmpty,
             hasCredential: _hasSecret(cfg),
+            multiplex: cfg.multiplex,
             registration: (registerNow && cfg.enabled)
                 ? CoreRegistration.registered
                 : CoreRegistration.unregistered,
